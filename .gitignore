@@ -1,0 +1,127 @@
+# =========================================================
+# HuggingFace / Transformers / Tokenizers Project
+# =========================================================
+
+# -------------------------------
+# Python
+# -------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Envs
+.venv/
+venv/
+env/
+ENV/
+
+# -------------------------------
+# HF Cache (VERY IMPORTANT)
+# -------------------------------
+# Transformers cache
+~/.cache/huggingface/
+huggingface/
+hf_cache/
+.cache/
+
+# Datasets cache
+~/.cache/huggingface/datasets/
+datasets_cache/
+datasets/
+
+# Tokenizers cache
+tokenizers_cache/
+*.json
+
+# -------------------------------
+# Model Checkpoints
+# -------------------------------
+*.bin
+*.pth
+*.pt
+*.safetensors
+*.ckpt
+checkpoints/
+checkpoints_*/
+runs/
+outputs/
+
+# PEFT / LoRA weights
+adapter_model/
+adapter_config.json
+*.opt
+
+# ONNX / TensorRT exported
+*.onnx
+*.engine
+*.trt
+
+# -------------------------------
+# SentencePiece / Tokenizer files
+# -------------------------------
+*.model
+*.vocab
+spiece.model
+spiece.vocab
+tokenizer.json
+tokenizer.model
+tokenizer_config.json
+special_tokens_map.json
+
+# -------------------------------
+# Logs / Results
+# -------------------------------
+logs/
+wandb/
+*.log
+tensorboard/
+events.out.tfevents.*
+
+# -------------------------------
+# Large data files
+# -------------------------------
+*.cache
+*.zip
+*.tar.gz
+*.tmp
+*.temp
+*.pickle
+
+data/
+raw_data/
+dataset/
+
+# -------------------------------
+# Jupyter
+# -------------------------------
+.ipynb_checkpoints/
+
+# -------------------------------
+# Build / Packaging
+# -------------------------------
+dist/
+build/
+*.egg-info/
+
+# -------------------------------
+# OS files
+# -------------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------------
+# Editors
+# -------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# -------------------------------
+# Other artifacts
+# -------------------------------
+*.png
+*.jpg
+*.jpeg
+*.pdf

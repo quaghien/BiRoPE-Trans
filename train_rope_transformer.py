@@ -35,9 +35,10 @@ class Config:
     spm_prefix = "./spm_zh_vi_joint"
     vocab_size = 16000
     
-    # Model architecture - LARGE WITH RoPE
+    # Model architecture - LARGE WITH RoPE AND GQA
     d_model = 1024          # Increased from 384
-    n_heads = 8           # Increased from 6
+    n_heads = 16           # Query heads
+    n_kv_heads = 4         # Key-Value heads for GQA (16:4 ratio)
     num_encoder_layers = 12 # Increased from 4
     num_decoder_layers = 12 # Increased from 4
     d_ff = 8192          # Increased from 1536 (4 * d_model)
@@ -219,20 +220,25 @@ class FFN_SwiGLU(nn.Module):
 # Multi-Head Attention with RoPE
 # =============================================================================
 
-class MultiHeadAttentionRoPE(nn.Module):
-    """Multi-head attention with RoPE."""
+class GroupedQueryAttentionRoPE(nn.Module):
+    """Grouped Query Attention with RoPE."""
     
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, rope_base: float = 10000.0):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, dropout: float = 0.1, rope_base: float = 10000.0):
         super().__init__()
         assert d_model % n_heads == 0
+        assert n_heads % n_kv_heads == 0, f"n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
         
         self.d_model = d_model
-        self.n_heads = n_heads
+        self.n_heads = n_heads  # Query heads
+        self.n_kv_heads = n_kv_heads  # Key-Value heads
+        self.n_groups = n_heads // n_kv_heads  # How many query heads per KV head
         self.d_k = d_model // n_heads
+        self.d_kv = d_model // n_heads  # Same head dimension
         
-        self.W_q = nn.Linear(d_model, d_model, bias=False)
-        self.W_k = nn.Linear(d_model, d_model, bias=False)
-        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        # Linear projections
+        self.W_q = nn.Linear(d_model, n_heads * self.d_k, bias=False)
+        self.W_k = nn.Linear(d_model, n_kv_heads * self.d_kv, bias=False)
+        self.W_v = nn.Linear(d_model, n_kv_heads * self.d_kv, bias=False)
         self.W_o = nn.Linear(d_model, d_model, bias=False)
         
         self.dropout = nn.Dropout(dropout)
@@ -262,10 +268,10 @@ class MultiHeadAttentionRoPE(nn.Module):
         B = q.size(0)
         T_q, T_k = q.size(1), k.size(1)
         
-        # Linear projections and split heads
+        # Linear projections
         Q = self.W_q(q).view(B, T_q, self.n_heads, self.d_k).transpose(1, 2)  # [B, n_heads, T_q, d_k]
-        K = self.W_k(k).view(B, T_k, self.n_heads, self.d_k).transpose(1, 2)  # [B, n_heads, T_k, d_k]
-        V = self.W_v(v).view(B, T_k, self.n_heads, self.d_k).transpose(1, 2)  # [B, n_heads, T_k, d_k]
+        K = self.W_k(k).view(B, T_k, self.n_kv_heads, self.d_kv).transpose(1, 2)  # [B, n_kv_heads, T_k, d_kv]
+        V = self.W_v(v).view(B, T_k, self.n_kv_heads, self.d_kv).transpose(1, 2)  # [B, n_kv_heads, T_k, d_kv]
         
         # Apply RoPE to Q and K
         cos_q, sin_q = self.rope(Q, T_q)
@@ -273,6 +279,11 @@ class MultiHeadAttentionRoPE(nn.Module):
         
         Q = apply_rope(Q, cos_q, sin_q)
         K = apply_rope(K, cos_k, sin_k)
+        
+        # Expand K and V to match query heads (GQA)
+        # Repeat each KV head n_groups times
+        K = K.repeat_interleave(self.n_groups, dim=1)  # [B, n_heads, T_k, d_kv]
+        V = V.repeat_interleave(self.n_groups, dim=1)  # [B, n_heads, T_k, d_kv]
         
         # Attention scores
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [B, n_heads, T_q, T_k]
@@ -311,13 +322,13 @@ class MultiHeadAttentionRoPE(nn.Module):
 # =============================================================================
 
 class EncoderLayer(nn.Module):
-    """Pre-LN Transformer encoder layer with RoPE."""
+    """Pre-LN Transformer encoder layer with RoPE and GQA."""
     
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1, rope_base: float = 10000.0):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout: float = 0.1, rope_base: float = 10000.0):
         super().__init__()
         
         self.ln1 = RMSNorm(d_model)
-        self.self_attn = MultiHeadAttentionRoPE(d_model, n_heads, dropout, rope_base)
+        self.self_attn = GroupedQueryAttentionRoPE(d_model, n_heads, n_kv_heads, dropout, rope_base)
         
         self.ln2 = RMSNorm(d_model)
         self.ffn = FFN_SwiGLU(d_model, d_ff, dropout)
@@ -354,16 +365,16 @@ class EncoderLayer(nn.Module):
 # =============================================================================
 
 class DecoderLayer(nn.Module):
-    """Pre-LN Transformer decoder layer with RoPE."""
+    """Pre-LN Transformer decoder layer with RoPE and GQA."""
     
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1, rope_base: float = 10000.0):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout: float = 0.1, rope_base: float = 10000.0):
         super().__init__()
         
         self.ln1 = RMSNorm(d_model)
-        self.self_attn = MultiHeadAttentionRoPE(d_model, n_heads, dropout, rope_base)
+        self.self_attn = GroupedQueryAttentionRoPE(d_model, n_heads, n_kv_heads, dropout, rope_base)
         
         self.ln2 = RMSNorm(d_model)
-        self.cross_attn = MultiHeadAttentionRoPE(d_model, n_heads, dropout, rope_base)
+        self.cross_attn = GroupedQueryAttentionRoPE(d_model, n_heads, n_kv_heads, dropout, rope_base)
         
         self.ln3 = RMSNorm(d_model)
         self.ffn = FFN_SwiGLU(d_model, d_ff, dropout)
@@ -437,14 +448,14 @@ class TransformerModel(nn.Module):
         
         # Encoder
         self.encoder_layers = nn.ModuleList([
-            EncoderLayer(config.d_model, config.n_heads, config.d_ff, config.dropout, config.rope_base)
+            EncoderLayer(config.d_model, config.n_heads, config.n_kv_heads, config.d_ff, config.dropout, config.rope_base)
             for _ in range(config.num_encoder_layers)
         ])
         self.encoder_final_ln = RMSNorm(config.d_model)
         
         # Decoder
         self.decoder_layers = nn.ModuleList([
-            DecoderLayer(config.d_model, config.n_heads, config.d_ff, config.dropout, config.rope_base)
+            DecoderLayer(config.d_model, config.n_heads, config.n_kv_heads, config.d_ff, config.dropout, config.rope_base)
             for _ in range(config.num_decoder_layers)
         ])
         self.decoder_final_ln = RMSNorm(config.d_model)
@@ -949,10 +960,11 @@ def main():
     os.makedirs(config.save_dir, exist_ok=True)
     
     print("=" * 80)
-    print("LARGE Bidirectional Transformer with RoPE Training (ZH<->VI)")
+    print("LARGE Bidirectional Transformer with RoPE + GQA Training (ZH<->VI)")
     print("=" * 80)
     print(f"Device: {config.device}")
-    print(f"Model: d_model={config.d_model}, n_heads={config.n_heads}")
+    print(f"Model: d_model={config.d_model}, n_heads={config.n_heads}, n_kv_heads={config.n_kv_heads}")
+    print(f"       GQA ratio: {config.n_heads}:{config.n_kv_heads} ({config.n_heads//config.n_kv_heads}x efficiency)")
     print(f"       num_layers={config.num_encoder_layers}+{config.num_decoder_layers}")
     print(f"       d_ff={config.d_ff}, dropout={config.dropout}")
     print(f"       RoPE base: {config.rope_base}")

@@ -7,13 +7,15 @@ import os
 import math
 import random
 import argparse
-from typing import Tuple, Optional
+from datetime import datetime
+from dataclasses import dataclass
+from typing import Tuple, Optional, Any, Dict
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
 import sentencepiece as spm
 try:
     import sacrebleu
@@ -33,17 +35,18 @@ class Config:
     
     # SentencePiece
     spm_prefix = "./spm_zh_vi_joint"
-    vocab_size = 16000
+    vocab_size = 8000
     
     # Model architecture - LARGE WITH RoPE
     d_model = 768          # Increased from 384
     n_heads = 12           # Increased from 6
+    n_kv_heads = 4         # Grouped KV heads (3 query heads per KV)
     num_encoder_layers = 8 # Increased from 4
     num_decoder_layers = 8 # Increased from 4
-    d_ff = 3072           # Increased from 1536 (4 * d_model)
-    dropout = 0.3         # Keep high dropout for large model
-    max_len = 64          # Maximum sequence length
-    rope_base = 10000     # RoPE base frequency
+    d_ff = 3072            # Increased from 1536 (4 * d_model)
+    dropout = 0.01         # Keep high dropout for large model
+    max_len = 32           # Maximum sequence length
+    rope_base = 10000      # RoPE base frequency
     
     # Special tokens
     pad_token = "<pad>"
@@ -55,24 +58,36 @@ class Config:
     
     # Training - Adjusted for larger model
     batch_size = 128       # Reduced due to larger model
-    num_epochs = 100
-    lr_base = 5e-4        # Reduced for larger model
-    warmup_steps = 2000   # Increased warmup
-    weight_decay = 0.05   # Keep high weight decay for regularization
-    label_smoothing = 0.1
+    num_epochs = 75
+    lr_base = 2e-4        # Reduced for larger model
+    warmup_steps = 1000   # Increased warmup
+    weight_decay = 0.01   # Keep high weight decay for regularization
+    label_smoothing = 0.01
     grad_clip = 1.0
-    span_mask_prob = 0.05  # 5% span masking
+    span_mask_prob = 0.01  # 10% span masking
+    vi2zh_epoch_ratio = 0.7  # Use 70% of vi->zh per epoch
     
     # Hardware
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_workers = 8
     
     # Checkpoint
-    save_dir = "./checkpoints_rope"
-    save_every = 10     # Save every N epochs
+    save_dir = "./checkpoints_v1"
+    save_every = 10   
     
     # Seed
     seed = 42
+
+
+def prepare_tokenizer_prefix(config: "Config") -> None:
+    """Assign a unique timestamped tokenizer prefix for this training run."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = os.path.dirname(config.spm_prefix) or "."
+    base_name = os.path.basename(config.spm_prefix) or "spm"
+    tokenizer_dir = os.path.join(base_dir, f"tokenizer_rope_{timestamp}")
+    os.makedirs(tokenizer_dir, exist_ok=True)
+    config.spm_prefix = os.path.join(tokenizer_dir, base_name)
+    print(f"Tokenizer output will be saved under {config.spm_prefix}.[model|vocab]")
 
 
 # =============================================================================
@@ -216,29 +231,32 @@ class FFN_SwiGLU(nn.Module):
 
 
 # =============================================================================
-# Multi-Head Attention with RoPE
+# Grouped Query Attention with RoPE
 # =============================================================================
 
-class MultiHeadAttentionRoPE(nn.Module):
-    """Multi-head attention with RoPE."""
+class GroupedQueryAttentionRoPE(nn.Module):
+    """Grouped Query Attention (GQA) with RoPE."""
     
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, rope_base: float = 10000.0):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, dropout: float = 0.1, rope_base: float = 10000.0):
         super().__init__()
         assert d_model % n_heads == 0
+        assert n_heads % n_kv_heads == 0, f"n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
         
         self.d_model = d_model
-        self.n_heads = n_heads
+        self.n_heads = n_heads           # Query heads
+        self.n_kv_heads = n_kv_heads     # Shared KV heads
+        self.n_groups = n_heads // n_kv_heads
         self.d_k = d_model // n_heads
+        self.d_kv = self.d_k
         
-        self.W_q = nn.Linear(d_model, d_model, bias=False)
-        self.W_k = nn.Linear(d_model, d_model, bias=False)
-        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        # Linear projections
+        self.W_q = nn.Linear(d_model, n_heads * self.d_k, bias=False)
+        self.W_k = nn.Linear(d_model, n_kv_heads * self.d_kv, bias=False)
+        self.W_v = nn.Linear(d_model, n_kv_heads * self.d_kv, bias=False)
         self.W_o = nn.Linear(d_model, d_model, bias=False)
         
         self.dropout = nn.Dropout(dropout)
         self.scale = math.sqrt(self.d_k)
-        
-        # RoPE
         self.rope = RoPE(self.d_k, base=rope_base)
     
     def forward(
@@ -262,47 +280,37 @@ class MultiHeadAttentionRoPE(nn.Module):
         B = q.size(0)
         T_q, T_k = q.size(1), k.size(1)
         
-        # Linear projections and split heads
-        Q = self.W_q(q).view(B, T_q, self.n_heads, self.d_k).transpose(1, 2)  # [B, n_heads, T_q, d_k]
-        K = self.W_k(k).view(B, T_k, self.n_heads, self.d_k).transpose(1, 2)  # [B, n_heads, T_k, d_k]
-        V = self.W_v(v).view(B, T_k, self.n_heads, self.d_k).transpose(1, 2)  # [B, n_heads, T_k, d_k]
+        Q = self.W_q(q).view(B, T_q, self.n_heads, self.d_k).transpose(1, 2)            # [B, n_heads, T_q, d_k]
+        K = self.W_k(k).view(B, T_k, self.n_kv_heads, self.d_kv).transpose(1, 2)        # [B, n_kv_heads, T_k, d_kv]
+        V = self.W_v(v).view(B, T_k, self.n_kv_heads, self.d_kv).transpose(1, 2)        # [B, n_kv_heads, T_k, d_kv]
         
-        # Apply RoPE to Q and K
         cos_q, sin_q = self.rope(Q, T_q)
         cos_k, sin_k = self.rope(K, T_k)
-        
         Q = apply_rope(Q, cos_q, sin_q)
         K = apply_rope(K, cos_k, sin_k)
         
-        # Attention scores
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [B, n_heads, T_q, T_k]
+        # Share KV heads across query groups (GQA)
+        K = K.repeat_interleave(self.n_groups, dim=1)
+        V = V.repeat_interleave(self.n_groups, dim=1)
         
-        # Apply masks
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        
         if key_padding_mask is not None:
-            # key_padding_mask: [B, T_k] -> [B, 1, 1, T_k]
             scores = scores.masked_fill(
                 key_padding_mask.unsqueeze(1).unsqueeze(2),
                 float('-inf')
             )
         
         if attn_mask is not None:
-            # attn_mask: [T_q, T_k] -> [1, 1, T_q, T_k]
             scores = scores.masked_fill(
                 attn_mask.unsqueeze(0).unsqueeze(0),
                 float('-inf')
             )
         
-        # Softmax and dropout
-        attn = F.softmax(scores, dim=-1)  # [B, n_heads, T_q, T_k]
+        attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
-        
-        # Apply attention to values
-        out = torch.matmul(attn, V)  # [B, n_heads, T_q, d_k]
-        
-        # Concatenate heads
-        out = out.transpose(1, 2).contiguous().view(B, T_q, self.d_model)  # [B, T_q, d_model]
-        
-        # Final linear
+        out = torch.matmul(attn, V)
+        out = out.transpose(1, 2).contiguous().view(B, T_q, self.d_model)
         return self.W_o(out)
 
 
@@ -313,11 +321,11 @@ class MultiHeadAttentionRoPE(nn.Module):
 class EncoderLayer(nn.Module):
     """Pre-LN Transformer encoder layer with RoPE."""
     
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1, rope_base: float = 10000.0):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout: float = 0.1, rope_base: float = 10000.0):
         super().__init__()
         
         self.ln1 = RMSNorm(d_model)
-        self.self_attn = MultiHeadAttentionRoPE(d_model, n_heads, dropout, rope_base)
+        self.self_attn = GroupedQueryAttentionRoPE(d_model, n_heads, n_kv_heads, dropout, rope_base)
         
         self.ln2 = RMSNorm(d_model)
         self.ffn = FFN_SwiGLU(d_model, d_ff, dropout)
@@ -356,14 +364,14 @@ class EncoderLayer(nn.Module):
 class DecoderLayer(nn.Module):
     """Pre-LN Transformer decoder layer with RoPE."""
     
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1, rope_base: float = 10000.0):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout: float = 0.1, rope_base: float = 10000.0):
         super().__init__()
         
         self.ln1 = RMSNorm(d_model)
-        self.self_attn = MultiHeadAttentionRoPE(d_model, n_heads, dropout, rope_base)
+        self.self_attn = GroupedQueryAttentionRoPE(d_model, n_heads, n_kv_heads, dropout, rope_base)
         
         self.ln2 = RMSNorm(d_model)
-        self.cross_attn = MultiHeadAttentionRoPE(d_model, n_heads, dropout, rope_base)
+        self.cross_attn = GroupedQueryAttentionRoPE(d_model, n_heads, n_kv_heads, dropout, rope_base)
         
         self.ln3 = RMSNorm(d_model)
         self.ffn = FFN_SwiGLU(d_model, d_ff, dropout)
@@ -437,14 +445,28 @@ class TransformerModel(nn.Module):
         
         # Encoder
         self.encoder_layers = nn.ModuleList([
-            EncoderLayer(config.d_model, config.n_heads, config.d_ff, config.dropout, config.rope_base)
+            EncoderLayer(
+                config.d_model,
+                config.n_heads,
+                config.n_kv_heads,
+                config.d_ff,
+                config.dropout,
+                config.rope_base
+            )
             for _ in range(config.num_encoder_layers)
         ])
         self.encoder_final_ln = RMSNorm(config.d_model)
         
         # Decoder
         self.decoder_layers = nn.ModuleList([
-            DecoderLayer(config.d_model, config.n_heads, config.d_ff, config.dropout, config.rope_base)
+            DecoderLayer(
+                config.d_model,
+                config.n_heads,
+                config.n_kv_heads,
+                config.d_ff,
+                config.dropout,
+                config.rope_base
+            )
             for _ in range(config.num_decoder_layers)
         ])
         self.decoder_final_ln = RMSNorm(config.d_model)
@@ -618,6 +640,9 @@ class BidirectionalTranslationDataset(Dataset):
                 # All validation samples are zh->vi
                 src_with_token = self.add_lang_token(src, "<2vi>")
                 self.samples.append((src_with_token, tgt, "zh2vi"))
+
+        self.zh2vi_indices = [idx for idx, (_, _, direction) in enumerate(self.samples) if direction == "zh2vi"]
+        self.vi2zh_indices = [idx for idx, (_, _, direction) in enumerate(self.samples) if direction == "vi2zh"]
     
     def add_lang_token(self, src: str, lang_tok: str) -> str:
         """Add language token if not already present."""
@@ -694,6 +719,20 @@ def collate_fn(batch):
         tgt_batch[i, :len(tgt)] = tgt
     
     return src_batch, tgt_batch
+
+
+def select_vi2zh_window(indices: list, epoch: int, ratio: float) -> list:
+    """Select a contiguous window of vi->zh indices that shifts each epoch."""
+    if not indices or ratio <= 0.0:
+        return []
+    total = len(indices)
+    window = max(1, int(math.ceil(total * min(ratio, 1.0))))
+    start = ((epoch - 1) * window) % total
+    end = start + window
+    if end <= total:
+        return indices[start:end]
+    wrap = end - total
+    return indices[start:] + indices[:wrap]
 
 
 # =============================================================================
@@ -867,6 +906,99 @@ def greedy_decode(
     return decoded_texts
 
 
+@dataclass
+class BeamSearchHypothesis:
+    tokens: list
+    log_prob: float
+
+
+@torch.no_grad()
+def beam_search_decode(
+    model: TransformerModel,
+    src_ids: torch.Tensor,
+    sp_model: spm.SentencePieceProcessor,
+    config: Config,
+    beam_size: int = 3,
+    top_k: int = 3,
+    max_len: int = 64,
+    length_penalty: float = 0.6,
+) -> list:
+    model.eval()
+    batch_size = src_ids.size(0)
+    device = src_ids.device
+    bos_id = sp_model.piece_to_id(config.bos_token)
+    eos_id = sp_model.piece_to_id(config.eos_token)
+    pad_id = sp_model.piece_to_id(config.pad_token)
+
+    src_pad_mask = (src_ids == pad_id)
+    src_emb = model.embedding(src_ids) * model.emb_scale
+    src_input = model.emb_dropout(src_emb)
+    enc_out = src_input
+    for layer in model.encoder_layers:
+        enc_out = layer(enc_out, src_pad_mask)
+    enc_out = model.encoder_final_ln(enc_out)
+
+    results = []
+    for b in range(batch_size):
+        beams = [BeamSearchHypothesis(tokens=[bos_id], log_prob=0.0)]
+        finished = []
+        single_enc = enc_out[b:b + 1]
+        single_mask = src_pad_mask[b:b + 1]
+
+        for _ in range(max_len):
+            new_beams = []
+            for beam in beams:
+                if beam.tokens[-1] == eos_id:
+                    finished.append(beam)
+                    continue
+
+                tgt_ids = torch.tensor(beam.tokens, dtype=torch.long, device=device).unsqueeze(0)
+                tgt_pad_mask = (tgt_ids == pad_id)
+                tgt_len = tgt_ids.size(1)
+                tgt_causal_mask = torch.triu(
+                    torch.ones(tgt_len, tgt_len, dtype=torch.bool, device=device),
+                    diagonal=1,
+                )
+
+                tgt_emb = model.embedding(tgt_ids) * model.emb_scale
+                tgt_input = model.emb_dropout(tgt_emb)
+                dec_out = tgt_input
+                for layer in model.decoder_layers:
+                    dec_out = layer(dec_out, single_enc, tgt_pad_mask, tgt_causal_mask, single_mask)
+                dec_out = model.decoder_final_ln(dec_out)
+
+                logits = F.linear(dec_out, model.embedding.weight, model.output_bias)
+                log_probs = F.log_softmax(logits[:, -1, :], dim=-1)
+
+                if top_k is not None and top_k > 0:
+                    top_vals, top_idx = torch.topk(log_probs, min(top_k, log_probs.size(-1)))
+                    filtered = torch.full_like(log_probs, float('-inf'))
+                    filtered.scatter_(1, top_idx, top_vals)
+                    log_probs = filtered
+
+                top_vals, top_idx = torch.topk(log_probs.squeeze(0), beam_size)
+                for val, idx in zip(top_vals.tolist(), top_idx.tolist()):
+                    new_beams.append(
+                        BeamSearchHypothesis(tokens=beam.tokens + [idx], log_prob=beam.log_prob + val)
+                    )
+
+            beams = sorted(new_beams, key=lambda h: h.log_prob, reverse=True)[:beam_size]
+            if not beams:
+                break
+
+        finished.extend(beams)
+        best = max(
+            finished,
+            key=lambda h: h.log_prob / (len(h.tokens) ** length_penalty),
+        )
+        tokens = best.tokens[1:]
+        if eos_id in tokens:
+            tokens = tokens[:tokens.index(eos_id)]
+        results.append(sp_model.decode(tokens))
+
+    return results
+
+
 @torch.no_grad()
 def evaluate(
     model: TransformerModel,
@@ -896,8 +1028,17 @@ def evaluate(
         loss = criterion(logits_flat, targets_flat)
         total_loss += loss.item()
         
-        # Generate predictions for BLEU score
-        predictions = greedy_decode(model, src_batch, sp_model, config)
+        # Generate predictions for BLEU score via beam search (beam=3, top-3)
+        predictions = beam_search_decode(
+            model,
+            src_batch,
+            sp_model,
+            config,
+            beam_size=3,
+            top_k=3,
+            max_len=config.max_len,
+            length_penalty=0.6,
+        )
         
         # Get reference texts (remove BOS/EOS tokens)
         bos_id = sp_model.piece_to_id(config.bos_token)
@@ -939,6 +1080,9 @@ def main():
     # Initialize config
     config = Config()
     
+    # Assign a unique tokenizer directory for this run
+    prepare_tokenizer_prefix(config)
+
     # Set random seed
     random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -1003,6 +1147,19 @@ def main():
     sp_model.Load(spm_model_path)
     vocab_size = sp_model.GetPieceSize()
     print(f"✓ Vocabulary size: {vocab_size}")
+    # Package tokenizer bytes to embed into checkpoints
+    def package_tokenizer(prefix: str) -> Dict[str, Any]:
+        model_path = f"{prefix}.model"
+        vocab_path = f"{prefix}.vocab"
+        if not os.path.isfile(model_path) or not os.path.isfile(vocab_path):
+            raise FileNotFoundError(f"Tokenizer files missing at {prefix}.[model|vocab]")
+        with open(model_path, "rb") as f:
+            model_bytes = f.read()
+        with open(vocab_path, "rb") as f:
+            vocab_bytes = f.read()
+        return {"prefix": prefix, "model_bytes": model_bytes, "vocab_bytes": vocab_bytes}
+
+    tokenizer_payload = package_tokenizer(config.spm_prefix)
     
     # ========== Step 2: Load Data ==========
     print("\n[2/6] Loading training data...")
@@ -1021,8 +1178,11 @@ def main():
     
     print(f"✓ Loaded {len(src_lines)} training samples")
     
-    # Split train/validation (90/10)
-    split_idx = int(0.9 * len(src_lines))
+    # Split train/validation (90/10) and force even index to preserve zh/vi pairing
+    split_idx = int(0.99999 * len(src_lines))
+    if split_idx % 2 != 0:
+        split_idx -= 1
+    split_idx = max(split_idx, 0)
     train_src, train_tgt = src_lines[:split_idx], tgt_lines[:split_idx]
     
     # For validation, only keep zh->vi direction (even indices from split point)
@@ -1041,16 +1201,13 @@ def main():
     
     train_dataset = BidirectionalTranslationDataset(train_src, train_tgt, sp_model, config, is_training=True)
     valid_dataset = BidirectionalTranslationDataset(valid_src, valid_tgt, sp_model, config, is_training=False)
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=config.num_workers,
-        pin_memory=True
+
+    print(
+        "✓ Train dataset: total={} | zh→vi={} | vi→zh={}".format(
+            len(train_dataset), len(train_dataset.zh2vi_indices), len(train_dataset.vi2zh_indices)
+        )
     )
-    
+
     valid_loader = DataLoader(
         valid_dataset,
         batch_size=config.batch_size,
@@ -1060,8 +1217,22 @@ def main():
         pin_memory=True
     )
     
-    print(f"✓ Train batches: {len(train_loader)}")
     print(f"✓ Valid batches: {len(valid_loader)}")
+
+    def build_train_loader(epoch: int) -> Tuple[DataLoader, int]:
+        active_indices = list(train_dataset.zh2vi_indices)
+        vi_slice = select_vi2zh_window(train_dataset.vi2zh_indices, epoch, config.vi2zh_epoch_ratio)
+        active_indices.extend(vi_slice)
+        sampler = SubsetRandomSampler(active_indices)
+        loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            sampler=sampler,
+            collate_fn=collate_fn,
+            num_workers=config.num_workers,
+            pin_memory=True,
+        )
+        return loader, len(vi_slice)
     
     # ========== Step 4: Initialize Model ==========
     print("\n[4/6] Initializing model...")
@@ -1105,6 +1276,7 @@ def main():
     best_val_bleu = 0.0
     
     for epoch in range(1, config.num_epochs + 1):
+        train_loader, vi_slice_len = build_train_loader(epoch)
         # Train
         train_loss = train_epoch(model, train_loader, criterion, optimizer, scheduler, config, epoch)
         
@@ -1112,6 +1284,9 @@ def main():
         val_loss, val_bleu = evaluate(model, valid_loader, criterion, sp_model, config)
         
         print(f"\nEpoch {epoch}/{config.num_epochs}")
+        print(
+            f"  vi→zh coverage: {vi_slice_len}/{len(train_dataset.vi2zh_indices)} samples (~{100 * config.vi2zh_epoch_ratio:.1f}% per epoch)"
+        )
         print(f"  Train Loss: {train_loss:.4f}")
         print(f"  Valid Loss: {val_loss:.4f}")
         print(f"  Valid BLEU: {val_bleu:.2f}")
@@ -1127,7 +1302,8 @@ def main():
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'val_bleu': val_bleu,
-                'config': config
+                'config': config,
+                'tokenizer': tokenizer_payload
             }, checkpoint_path)
             print(f"  ✓ Checkpoint saved to {checkpoint_path}")
         
@@ -1143,7 +1319,8 @@ def main():
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'val_bleu': val_bleu,
-                'config': config
+                'config': config,
+                'tokenizer': tokenizer_payload
             }, best_model_path)
             print(f"  ✓ Best model saved! (val_loss: {val_loss:.4f}, val_bleu: {val_bleu:.2f})")
         

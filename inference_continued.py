@@ -110,6 +110,11 @@ class PlanCLBiCrossConfig(InferenceConfig):
     pass
 
 
+class PlanCLFineTuneConfig(InferenceConfig):
+    """Placeholder for finetune checkpoints pickled with this config class."""
+    pass
+
+
 # =============================================================================
 # Checkpoint helpers
 # =============================================================================
@@ -626,7 +631,7 @@ def beam_search_decode(
 def main():
     parser = argparse.ArgumentParser(description='Inference with continued RoPE Transformer')
     parser.add_argument('--checkpoint', type=str, 
-                       default='/home/crl/hienhq/olym/checkpoints_resume_v2/resume_epoch_49.pt',
+                       default='/home/crl/hienhq/olym/contrastive_v1/v1_best.pt',
                        help='Path to checkpoint')
     parser.add_argument('--dataset', type=str, choices=['public', 'private'], default='public',
                        help='Which test dataset to use')
